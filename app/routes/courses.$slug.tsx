@@ -1,5 +1,5 @@
-import { useEffect } from "react";
-import { Link, useSearchParams } from "react-router";
+import { useEffect, useState } from "react";
+import { Link, useSearchParams, useFetcher } from "react-router";
 import { toast } from "sonner";
 import type { Route } from "./+types/courses.$slug";
 import {
@@ -27,21 +27,31 @@ import {
 } from "~/components/ui/tabs";
 import {
   AlertTriangle,
+  Bookmark,
   BookOpen,
   CheckCircle2,
   Circle,
   Clock,
   Pencil,
   PlayCircle,
+  Star,
   Users,
 } from "lucide-react";
 import { CourseImage } from "~/components/course-image";
 import { UserAvatar } from "~/components/user-avatar";
 import { data, isRouteErrorResponse } from "react-router";
+import * as v from "valibot";
 import { formatDuration, formatPrice } from "~/lib/utils";
+import { parseFormData } from "~/lib/validation";
 import { renderMarkdown } from "~/lib/markdown.server";
 import { resolveCountry } from "~/lib/country.server";
 import { calculatePppPrice, getCountryTierInfo } from "~/lib/ppp";
+import {
+  getAverageRating,
+  getUserRating,
+  rateCourse,
+} from "~/services/ratingService";
+import { getBookmarkedLessonIds } from "~/services/bookmarkService";
 
 export function meta({ data: loaderData }: Route.MetaArgs) {
   const title = loaderData?.course?.title ?? "Course";
@@ -71,6 +81,8 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   let progress = 0;
   let lessonProgressMap: Record<number, string> = {};
   let nextLessonId: number | null = null;
+  let userRating: number | null = null;
+  let bookmarkedLessonIds: number[] = [];
 
   if (currentUserId) {
     enrolled = isUserEnrolled(currentUserId, course.id);
@@ -88,8 +100,20 @@ export async function loader({ params, request }: Route.LoaderArgs) {
 
       const nextLesson = getNextIncompleteLesson(currentUserId, course.id);
       nextLessonId = nextLesson?.id ?? null;
+
+      const existingRating = getUserRating(currentUserId, course.id);
+      userRating = existingRating?.rating ?? null;
+
+      bookmarkedLessonIds = getBookmarkedLessonIds({
+        userId: currentUserId,
+        courseId: course.id,
+      });
     }
   }
+
+  const { average: averageRating, count: ratingCount } = getAverageRating(
+    course.id
+  );
 
   // Render sales copy from Markdown to HTML server-side
   const salesCopyHtml = courseWithDetails.salesCopy
@@ -113,10 +137,51 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     currentUserId,
     pppPrice,
     tierInfo,
+    averageRating,
+    ratingCount,
+    userRating,
+    bookmarkedLessonIds,
   };
 }
 
-// No action — enrollment is handled via the purchase confirmation page
+const rateActionSchema = v.variant("intent", [
+  v.object({
+    intent: v.literal("rate-course"),
+    rating: v.pipe(
+      v.unknown(),
+      v.transform(Number),
+      v.integer(),
+      v.minValue(1),
+      v.maxValue(5)
+    ),
+  }),
+]);
+
+export async function action({ params, request }: Route.ActionArgs) {
+  const currentUserId = await getCurrentUserId(request);
+  if (!currentUserId) {
+    throw data("Sign in required", { status: 401 });
+  }
+
+  const course = getCourseBySlug(params.slug);
+  if (!course) {
+    throw data("Course not found", { status: 404 });
+  }
+
+  if (!isUserEnrolled(currentUserId, course.id)) {
+    throw data("You must be enrolled to rate this course", { status: 403 });
+  }
+
+  const formData = await request.formData();
+  const parsed = parseFormData(formData, rateActionSchema);
+
+  if (!parsed.success) {
+    throw data("Invalid rating", { status: 400 });
+  }
+
+  rateCourse(currentUserId, course.id, parsed.data.rating);
+  return { success: true };
+}
 
 export function HydrateFallback() {
   return (
@@ -181,7 +246,12 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
     currentUserId,
     pppPrice,
     tierInfo,
+    averageRating,
+    ratingCount,
+    userRating,
+    bookmarkedLessonIds,
   } = loaderData;
+  const bookmarkedSet = new Set(bookmarkedLessonIds);
   const isInstructor = currentUserId === course.instructorId;
   const [searchParams, setSearchParams] = useSearchParams();
 
@@ -320,6 +390,24 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
               {formatDuration(totalDuration, true, false, false)} total
             </span>
           )}
+          {averageRating !== null && (
+            <span className="flex items-center gap-1">
+              {Array.from({ length: 5 }).map((_, i) => (
+                <Star
+                  key={i}
+                  className={`size-4 ${
+                    i < Math.round(averageRating)
+                      ? "fill-amber-400 text-amber-400"
+                      : "text-muted-foreground/30"
+                  }`}
+                />
+              ))}
+              <span className="ml-0.5 font-medium text-foreground">
+                {averageRating}
+              </span>
+              <span>({ratingCount})</span>
+            </span>
+          )}
         </div>
       </div>
 
@@ -355,6 +443,7 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
               enrolled={enrolled}
               isInstructor={isInstructor}
               lessonProgressMap={lessonProgressMap}
+              bookmarkedLessonIds={bookmarkedSet}
             />
           </div>
         </div>
@@ -413,6 +502,12 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
                       Buy More Seats
                     </Button>
                   </Link>
+                  {!isInstructor && (
+                    <RatingWidget
+                      courseSlug={course.slug}
+                      userRating={userRating}
+                    />
+                  )}
                 </>
               ) : (
                 enrollButton
@@ -450,11 +545,80 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
   );
 }
 
+function RatingWidget({
+  courseSlug,
+  userRating,
+}: {
+  courseSlug: string;
+  userRating: number | null;
+}) {
+  const fetcher = useFetcher();
+  const [hoveredStar, setHoveredStar] = useState<number | null>(null);
+
+  const optimisticRating = fetcher.formData
+    ? Number(fetcher.formData.get("rating"))
+    : userRating;
+  const isSubmitting = fetcher.state !== "idle";
+
+  useEffect(() => {
+    if (fetcher.state === "idle" && fetcher.data?.success) {
+      toast.success("Rating saved!");
+    }
+  }, [fetcher.state, fetcher.data]);
+
+  return (
+    <div className="border-t pt-4">
+      <p className="mb-2 text-sm font-medium">Rate this course</p>
+      <div className="flex gap-1">
+        {Array.from({ length: 5 }).map((_, i) => {
+          const starValue = i + 1;
+          const isFilled =
+            hoveredStar !== null
+              ? starValue <= hoveredStar
+              : optimisticRating !== null && starValue <= optimisticRating;
+
+          return (
+            <fetcher.Form
+              key={i}
+              method="post"
+              action={`/courses/${courseSlug}`}
+            >
+              <input type="hidden" name="intent" value="rate-course" />
+              <input type="hidden" name="rating" value={starValue} />
+              <button
+                type="submit"
+                disabled={isSubmitting}
+                className="rounded p-0.5 transition-colors hover:bg-muted disabled:opacity-50"
+                onMouseEnter={() => setHoveredStar(starValue)}
+                onMouseLeave={() => setHoveredStar(null)}
+              >
+                <Star
+                  className={`size-6 transition-colors ${
+                    isFilled
+                      ? "fill-amber-400 text-amber-400"
+                      : "text-muted-foreground/30 hover:text-amber-300"
+                  }`}
+                />
+              </button>
+            </fetcher.Form>
+          );
+        })}
+      </div>
+      {optimisticRating !== null && (
+        <p className="mt-1 text-xs text-muted-foreground">
+          Your rating: {optimisticRating}/5
+        </p>
+      )}
+    </div>
+  );
+}
+
 function CourseContent({
   course,
   enrolled,
   isInstructor,
   lessonProgressMap,
+  bookmarkedLessonIds,
 }: {
   course: {
     id: number;
@@ -472,6 +636,7 @@ function CourseContent({
   enrolled: boolean;
   isInstructor: boolean;
   lessonProgressMap: Record<number, string>;
+  bookmarkedLessonIds: Set<number>;
 }) {
   return (
     <div>
@@ -482,106 +647,118 @@ function CourseContent({
         </p>
       ) : (
         <div className="space-y-4">
-          {course.modules.map((mod) => (
-            <Card key={mod.id}>
-              <CardHeader>
-                <h3 className="font-semibold">
-                  <Link
-                    to={`/courses/${course.slug}/${mod.id}`}
-                    className="hover:underline"
-                  >
-                    {mod.title}
-                  </Link>
-                </h3>
-                <p className="text-sm text-muted-foreground">
-                  {mod.lessons.length} lessons
-                </p>
-              </CardHeader>
-              <CardContent>
-                <ul className="space-y-2">
-                  {mod.lessons.map((lesson) => {
-                    const status = lessonProgressMap[lesson.id];
-                    const isCompleted =
-                      status === LessonProgressStatus.Completed;
-                    const isLessonInProgress =
-                      status === LessonProgressStatus.InProgress;
+          {course.modules.map((mod) => {
+            const hasBookmark = mod.lessons.some((l) =>
+              bookmarkedLessonIds.has(l.id)
+            );
 
-                    if (isInstructor) {
+            return (
+              <Card key={mod.id}>
+                <CardHeader>
+                  <h3 className="flex items-center gap-2 font-semibold">
+                    <Link
+                      to={`/courses/${course.slug}/${mod.id}`}
+                      className="hover:underline"
+                    >
+                      {mod.title}
+                    </Link>
+                    {hasBookmark && (
+                      <Bookmark className="size-3.5 shrink-0 fill-amber-500 text-amber-500" />
+                    )}
+                  </h3>
+                  <p className="text-sm text-muted-foreground">
+                    {mod.lessons.length} lessons
+                  </p>
+                </CardHeader>
+                <CardContent>
+                  <ul className="space-y-2">
+                    {mod.lessons.map((lesson) => {
+                      const status = lessonProgressMap[lesson.id];
+                      const isCompleted =
+                        status === LessonProgressStatus.Completed;
+                      const isLessonInProgress =
+                        status === LessonProgressStatus.InProgress;
+
+                      if (isInstructor) {
+                        return (
+                          <li key={lesson.id}>
+                            <Link
+                              to={`/instructor/${course.id}/lessons/${lesson.id}`}
+                              className="flex items-center gap-3 rounded-md px-3 py-2 text-sm hover:bg-muted"
+                            >
+                              <Pencil className="size-4 shrink-0 text-muted-foreground" />
+                              <span className="flex-1">{lesson.title}</span>
+                              {lesson.durationMinutes && (
+                                <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                                  <Clock className="size-3" />
+                                  {formatDuration(
+                                    lesson.durationMinutes,
+                                    true,
+                                    false,
+                                    false
+                                  )}
+                                </span>
+                              )}
+                            </Link>
+                          </li>
+                        );
+                      }
+
                       return (
                         <li key={lesson.id}>
-                          <Link
-                            to={`/instructor/${course.id}/lessons/${lesson.id}`}
-                            className="flex items-center gap-3 rounded-md px-3 py-2 text-sm hover:bg-muted"
-                          >
-                            <Pencil className="size-4 shrink-0 text-muted-foreground" />
-                            <span className="flex-1">{lesson.title}</span>
-                            {lesson.durationMinutes && (
-                              <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                                <Clock className="size-3" />
-                                {formatDuration(
-                                  lesson.durationMinutes,
-                                  true,
-                                  false,
-                                  false
-                                )}
-                              </span>
-                            )}
-                          </Link>
+                          {enrolled ? (
+                            <Link
+                              to={`/courses/${course.slug}/lessons/${lesson.id}`}
+                              className="flex items-center gap-3 rounded-md px-3 py-2 text-sm hover:bg-muted"
+                            >
+                              {isCompleted ? (
+                                <CheckCircle2 className="size-4 shrink-0 text-green-500" />
+                              ) : isLessonInProgress ? (
+                                <PlayCircle className="size-4 shrink-0 text-blue-500" />
+                              ) : (
+                                <Circle className="size-4 shrink-0 text-muted-foreground" />
+                              )}
+                              <span className="flex-1">{lesson.title}</span>
+                              {lesson.durationMinutes && (
+                                <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                                  <Clock className="size-3" />
+                                  {formatDuration(
+                                    lesson.durationMinutes,
+                                    true,
+                                    false,
+                                    false
+                                  )}
+                                </span>
+                              )}
+                              {bookmarkedLessonIds.has(lesson.id) && (
+                                <Bookmark className="size-4 shrink-0 fill-amber-500 text-amber-500" />
+                              )}
+                            </Link>
+                          ) : (
+                            <div className="flex items-center gap-3 px-3 py-2 text-sm">
+                              <Circle className="size-4 shrink-0 text-muted-foreground" />
+                              <span className="flex-1">{lesson.title}</span>
+                              {lesson.durationMinutes && (
+                                <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                                  <Clock className="size-3" />
+                                  {formatDuration(
+                                    lesson.durationMinutes,
+                                    true,
+                                    false,
+                                    false
+                                  )}
+                                </span>
+                              )}
+                            </div>
+                          )}
                         </li>
                       );
-                    }
-
-                    return (
-                      <li key={lesson.id}>
-                        {enrolled ? (
-                          <Link
-                            to={`/courses/${course.slug}/lessons/${lesson.id}`}
-                            className="flex items-center gap-3 rounded-md px-3 py-2 text-sm hover:bg-muted"
-                          >
-                            {isCompleted ? (
-                              <CheckCircle2 className="size-4 shrink-0 text-green-500" />
-                            ) : isLessonInProgress ? (
-                              <PlayCircle className="size-4 shrink-0 text-blue-500" />
-                            ) : (
-                              <Circle className="size-4 shrink-0 text-muted-foreground" />
-                            )}
-                            <span className="flex-1">{lesson.title}</span>
-                            {lesson.durationMinutes && (
-                              <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                                <Clock className="size-3" />
-                                {formatDuration(
-                                  lesson.durationMinutes,
-                                  true,
-                                  false,
-                                  false
-                                )}
-                              </span>
-                            )}
-                          </Link>
-                        ) : (
-                          <div className="flex items-center gap-3 px-3 py-2 text-sm">
-                            <Circle className="size-4 shrink-0 text-muted-foreground" />
-                            <span className="flex-1">{lesson.title}</span>
-                            {lesson.durationMinutes && (
-                              <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                                <Clock className="size-3" />
-                                {formatDuration(
-                                  lesson.durationMinutes,
-                                  true,
-                                  false,
-                                  false
-                                )}
-                              </span>
-                            )}
-                          </div>
-                        )}
-                      </li>
-                    );
-                  })}
-                </ul>
-              </CardContent>
-            </Card>
-          ))}
+                    })}
+                  </ul>
+                </CardContent>
+              </Card>
+            );
+          })}
         </div>
       )}
     </div>

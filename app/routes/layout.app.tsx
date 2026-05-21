@@ -13,6 +13,11 @@ import {
 } from "~/services/progressService";
 import { getCountryTierInfo, COUNTRIES } from "~/lib/ppp";
 import { isTeamAdmin } from "~/services/teamService";
+import {
+  getNotifications,
+  getUnreadCount,
+} from "~/services/notificationService";
+import { UserRole } from "~/db/schema";
 
 export async function loader({ request }: Route.LoaderArgs) {
   const users = getAllUsers();
@@ -46,6 +51,16 @@ export async function loader({ request }: Route.LoaderArgs) {
       })
     : [];
 
+  const isInstructor = currentUser?.role === UserRole.Instructor;
+  const userIsTeamAdmin = currentUserId ? isTeamAdmin(currentUserId) : false;
+  const showNotifications = (isInstructor || userIsTeamAdmin) && currentUserId;
+  const notifications = showNotifications
+    ? getNotifications(currentUserId, 5, 0)
+    : [];
+  const notificationUnreadCount = showNotifications
+    ? getUnreadCount(currentUserId)
+    : 0;
+
   return {
     users: users.map((u) => ({ id: u.id, name: u.name, role: u.role })),
     currentUser: currentUser
@@ -60,7 +75,9 @@ export async function loader({ request }: Route.LoaderArgs) {
     devCountry,
     countryTierInfo,
     countries: COUNTRIES,
-    isTeamAdmin: currentUserId ? isTeamAdmin(currentUserId) : false,
+    isTeamAdmin: userIsTeamAdmin,
+    notifications,
+    notificationUnreadCount,
   };
 }
 
@@ -73,6 +90,8 @@ export default function AppLayout({ loaderData }: Route.ComponentProps) {
     countryTierInfo,
     countries,
     isTeamAdmin: userIsTeamAdmin,
+    notifications,
+    notificationUnreadCount,
   } = loaderData;
 
   return (
@@ -81,6 +100,8 @@ export default function AppLayout({ loaderData }: Route.ComponentProps) {
         currentUser={currentUser}
         recentCourses={recentCourses}
         isTeamAdmin={userIsTeamAdmin}
+        notifications={notifications}
+        notificationUnreadCount={notificationUnreadCount}
       />
       <main className="flex-1 overflow-y-auto">
         <Outlet />
